@@ -22,6 +22,7 @@
 #include <VapourSynth.h>
 #include <VSHelper.h>
 
+#include <movit/init.h>
 #include <movit/effect.h>
 #include <movit/effect_chain.h>
 #include <movit/resource_pool.h>
@@ -412,7 +413,13 @@ static void VS_CC filterCreate(const VSMap *in, VSMap *out, void *userData, VSCo
     d.vi = vsapi->getVideoInfo(d.node);
 
     int err;
-    std::string chainDefinition(vsapi->propGetData(in, "chain", 0, &err));
+    const char *chainData = vsapi->propGetData(in, "chain", 0, &err);
+    if (!chainData) {
+        error = "Missing chain defintion";
+        vsapi->setError(out, error.c_str());
+        return;
+    }
+    std::string chainDefinition(chainData);
     if (err || chainDefinition.empty()) {
         error = "Invalid chain defintion: " + chainDefinition;
         vsapi->setError(out, error.c_str());
@@ -441,10 +448,20 @@ static void VS_CC filterCreate(const VSMap *in, VSMap *out, void *userData, VSCo
 
     eglMakeCurrent(d.eglDpy, d.eglSurf, d.eglSurf, d.eglCtx);
 
+    if (!movit::init_movit("/usr/share/movit/", movit::MOVIT_DEBUG_OFF)) {
+        error = "Failed to initialize movit";
+        vsapi->setError(out, error.c_str());
+        return;
+    }
+
     d.chain = std::make_shared<movit::EffectChain>(d.pbufferWidth, d.pbufferHeight);
 
     movit::ImageFormat inout_format;
-    std::string colorspace(vsapi->propGetData(in, "colorspace", 0, &err));
+    std::string colorspace;
+    const char *colorspaceRaw = vsapi->propGetData(in, "colorspace", 0, &err);
+    if (colorspaceRaw) {
+        colorspace = colorspaceRaw;
+    }
     if (colorspace == "sRGB") {
         inout_format.color_space = movit::COLORSPACE_sRGB;
     } else if (colorspace == "REC_709") {
@@ -459,7 +476,11 @@ static void VS_CC filterCreate(const VSMap *in, VSMap *out, void *userData, VSCo
         inout_format.color_space = movit::COLORSPACE_sRGB;
     }
 
-    std::string gammacurve(vsapi->propGetData(in, "gammacurve", 0, &err));
+    std::string gammacurve;
+    const char *gammacurveRaw = vsapi->propGetData(in, "gammacurve", 0, &err);
+    if (gammacurveRaw) {
+        gammacurve = gammacurveRaw;
+    }
     if (gammacurve == "LINEAR") {
         inout_format.gamma_curve = movit::GAMMA_LINEAR;
     } else if (gammacurve == "sRGB") {
@@ -509,18 +530,76 @@ static void VS_CC filterCreate(const VSMap *in, VSMap *out, void *userData, VSCo
 
     switch(d.vi->format->colorFamily) {
     case cmRGB: {
-        d.flatInput = new movit::FlatInput(inout_format, movit::FORMAT_BGRA_POSTMULTIPLIED_ALPHA, d.datatype, d.pbufferWidth, d.pbufferHeight);
+        //d.flatInput = new movit::FlatInput(inout_format, movit::FORMAT_BGRA_POSTMULTIPLIED_ALPHA, d.datatype, d.pbufferWidth, d.pbufferHeight);
+        d.flatInput = new movit::FlatInput(inout_format, movit::FORMAT_BGRA_POSTMULTIPLIED_ALPHA, d.format, d.pbufferWidth, d.pbufferHeight);
         d.chain->add_input(d.flatInput);
         break;
     }
     case cmYUV: {
-        //// todo fetch and check all the parameters
+        //// todo fetch and check all the parameters, and get the ones we can automatically from the input
+        // or something
         movit::YCbCrFormat format; /////
 
+        //      Which formula for Y' to use.
+        //      YCbCrLumaCoefficients luma_coefficients;
+        std::string ycbcrFormat;
+        const char *ycbcrFormatRaw = vsapi->propGetData(in, "ycbcr_lumacoefficients", 0, &err);
+        if (ycbcrFormatRaw) {
+            ycbcrFormat = ycbcrFormatRaw;
+        }
+        if (ycbcrFormat == "REC_601") {
+            format.luma_coefficients = movit::YCBCR_REC_601;
+        } else if (ycbcrFormat == "REC_709") {
+            format.luma_coefficients = movit::YCBCR_REC_709;
+        } else if (ycbcrFormat == "REC_2020") {
+            format.luma_coefficients = movit::YCBCR_REC_2020;
+        } else {
+            format.luma_coefficients = movit::YCBCR_REC_709;
+        }
+
+        //      // If true, assume Y'CbCr coefficients are full-range, ie. go from 0 to 255
+        //      // instead of the limited 220/225 steps in classic MPEG. For instance,
+        //      // JPEG uses the Rec. 601 luma coefficients, but full range.
+        format.full_range = int64ToIntS(vsapi->propGetInt(in, "ycbcr_fullrange", 0, &err));
+
+        //      // Set to 2^n for n-bit Y'CbCr (e.g. 256 for 8-bit Y'CbCr).
+        //      // See file-level comment.
+        format.num_levels = int64ToIntS(vsapi->propGetInt(in, "ycbcr_num_levels", 0, &err));
+        //if (!format.num_levels) {
+        //    format.num_levels = 256;
+        //}
+
+        //      // Sampling factors for chroma components. For no subsampling (4:4:4),
+        //      // set both to 1.
+        //      unsigned chroma_subsampling_x, chroma_subsampling_y;
+        format.chroma_subsampling_x = int64ToIntS(vsapi->propGetInt(in, "ycbcr_chroma_subsampling_x", 0, &err));
+        format.chroma_subsampling_y = int64ToIntS(vsapi->propGetInt(in, "ycbcr_chroma_subsampling_y", 0, &err));
+        if (!format.chroma_subsampling_x) {
+            format.chroma_subsampling_x = 1;
+        }
+        if (!format.chroma_subsampling_y) {
+            format.chroma_subsampling_y = 1;
+        }
+
+        //      // Positioning of the chroma samples. MPEG-1 and JPEG is (0.5, 0.5);
+        //      // MPEG-2 and newer typically are (0.0, 0.5).
+        //      float cb_x_position, cb_y_position;
+        //      float cr_x_position, cr_y_position;
+        format.cb_x_position = vsapi->propGetFloat(in, "ycbcr_cb_x_position", 0, &err);
+        format.cb_y_position = vsapi->propGetFloat(in, "ycbcr_cb_y_position", 0, &err);
+        format.cr_x_position = vsapi->propGetFloat(in, "ycbcr_cr_x_position", 0, &err);
+        format.cr_y_position = vsapi->propGetFloat(in, "ycbcr_cr_x_position", 0, &err);
+        if (err != 0) format.cr_y_position = 0.5f; // some default I guess
+
         if (d.vi->format->id == pfYUV422P8) {
+            if (!format.chroma_subsampling_x) format.chroma_subsampling_x = 2;
+            if (!format.chroma_subsampling_y) format.chroma_subsampling_y = 2;
             assert(false);
+            // requires chroma_subsampling_x = 2 and chroma_subsampling_y = 1
             //d.ycbcrInput = new movit::YCbCr422InterleavedInput(inout_format, format, d.pbufferWidth, d.pbufferHeight);
         } else {
+            if (!format.chroma_subsampling_x) format.chroma_subsampling_x = 2;
+            if (!format.chroma_subsampling_y) format.chroma_subsampling_y = 1;
             d.ycbcrInput = new movit::YCbCrInput(inout_format, format, d.pbufferWidth, d.pbufferHeight, movit::YCBCR_INPUT_PLANAR, d.datatype);
         }
         d.chain->add_input(d.ycbcrInput);
@@ -564,8 +643,10 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegiste
 {
     configFunc("net.sesse.movit", "movit", "GPU accelerated effects and stuff", VAPOURSYNTH_API_VERSION, 1, plugin);
 
-    registerFunc("Movit"
-            ,
+    registerFunc(
+            // name
+            "Movit"
+            , // args
             "clip:clip;"
             "contextWidth:int;"
             "contextHeight:int;"
@@ -574,17 +655,18 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegiste
             "gammacurve:data:opt;"
             "ycbcr_fullrange:int:opt;"
             "ycbcr_num_levels:int:opt;"
+            "ycbcr_lumacoefficients:data:opt;"
             "ycbcr_chroma_subsampling_x:int:opt;"
             "ycbcr_chroma_subsampling_y:int:opt;"
             "ycbcr_cb_x_position:float:opt;"
             "ycbcr_cb_y_position:float:opt;"
             "ycbcr_cr_y_position:float:opt;"
             "ycbcr_cr_x_position:float:opt;"
-            ,
+            , // create function
             filterCreate
-            ,
+            , // function data
             0
-            ,
+            , // VSPlugin
             plugin
     );
 }
